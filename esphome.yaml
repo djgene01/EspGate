@@ -1,6 +1,11 @@
 esphome:
   name: maingate
   friendly_name: MainGate
+  on_boot:
+    priority: -10
+    then:
+      - switch.turn_on: r_en
+      - switch.turn_on: l_en
 
 esp32:
   board: esp32dev
@@ -29,7 +34,6 @@ captive_portal:
 
 # ----------------- persistent/staging state -----------------
 globals:
-  # Two learned buttons (both perform same action chain)
   - id: b1_addr
     type: uint32_t
     restore_value: yes
@@ -46,8 +50,23 @@ globals:
     type: uint32_t
     restore_value: yes
     initial_value: '0'
+  - id: b3_addr
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: b3_cmd
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: b4_addr
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+  - id: b4_cmd
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
 
-  # Enrollment flow: 0=none, 1=btn1, 2=btn2
   - id: enroll_target
     type: uint8_t
     initial_value: '0'
@@ -61,28 +80,40 @@ globals:
     type: uint32_t
     initial_value: '0'
 
-  # Debounce
   - id: last_fire_ms
     type: uint32_t
     initial_value: '0'
 
-  # Motor state: 0=stopped, 1=forward, 2=reverse
+  # 0=stopped, 1=forward (closing), 2=reverse (opening)
   - id: motor_state
     type: uint8_t
     restore_value: no
     initial_value: '0'
 
-  # Remember the last completed/forced direction (1=forward, 2=reverse)
+  # 1=forward, 2=reverse
   - id: last_dir
     type: uint8_t
     restore_value: no
     initial_value: '0'
 
-  # Auto-close state flag
   - id: auto_close_armed
     type: bool
     restore_value: no
     initial_value: 'false'
+
+  # Obstacle detection helpers
+  - id: oc_over_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: oc_handling
+    type: bool
+    initial_value: 'false'
+
+  # motor_phase: 0=idle, 1=soft_start, 2=mid_run, 3=soft_stop
+  - id: motor_phase
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
 
 remote_receiver:
   pin:
@@ -96,14 +127,14 @@ remote_receiver:
   on_keeloq:
     then:
       - lambda: |-
-          const uint32_t QUIET_MS = 350;  // enrollment capture quiet time
-          const uint32_t MIN_GAP  = 800;  // ignore RF repeat bursts
+          const uint32_t QUIET_MS = 350;
+          const uint32_t MIN_GAP  = 800;
 
           uint32_t now = millis();
           static uint32_t last_cap_ms = 0;
           bool can_capture = (now - last_cap_ms) > QUIET_MS;
 
-          // ---------- Enrollment ----------
+          // Enrollment (supports targets 1..4)
           if (id(enroll_target) != 0 && id(cap_needed) > 0 && can_capture) {
             last_cap_ms = now;
             if (id(cap_needed) == 2) {
@@ -112,48 +143,87 @@ remote_receiver:
               id(cap_needed) = 1;
             } else {
               if (x.address == id(cap_address) && x.command == id(cap_command)) {
+                // commit to correct slot
                 if (id(enroll_target) == 1) {
                   id(b1_addr)=id(cap_address); id(b1_cmd)=id(cap_command);
                   id(rf_b1_info).publish_state("ok");
-                } else {
+                } else if (id(enroll_target) == 2) {
                   id(b2_addr)=id(cap_address); id(b2_cmd)=id(cap_command);
                   id(rf_b2_info).publish_state("ok");
+                } else if (id(enroll_target) == 3) {
+                  id(b3_addr)=id(cap_address); id(b3_cmd)=id(cap_command);
+                  id(rf_b3_info).publish_state("ok");
+                } else {
+                  id(b4_addr)=id(cap_address); id(b4_cmd)=id(cap_command);
+                  id(rf_b4_info).publish_state("ok");
                 }
                 id(enroll_target)=0; id(cap_address)=0; id(cap_command)=0; id(cap_needed)=0;
               } else {
                 id(cap_needed)=2;
                 if (id(enroll_target) == 1) id(rf_b1_info).publish_state("mismatch; retry");
-                else                         id(rf_b2_info).publish_state("mismatch; retry");
+                else if (id(enroll_target) == 2) id(rf_b2_info).publish_state("mismatch; retry");
+                else if (id(enroll_target) == 3) id(rf_b3_info).publish_state("mismatch; retry");
+                else id(rf_b4_info).publish_state("mismatch; retry");
               }
             }
             return; // don't trigger motors during enrollment
           }
 
-          // ---------- Runtime matching ----------
+          // Runtime matching (supports 4 learned buttons)
           auto match = [&](uint32_t a, uint32_t c){ return a!=0 && c!=0 && x.address==a && x.command==c; };
-          bool isAny = match(id(b1_addr), id(b1_cmd)) || match(id(b2_addr), id(b2_cmd));
+          bool is1 = match(id(b1_addr), id(b1_cmd));
+          bool is2 = match(id(b2_addr), id(b2_cmd));
+          bool is3 = match(id(b3_addr), id(b3_cmd));
+          bool is4 = match(id(b4_addr), id(b4_cmd));
+          bool isAny = is1 || is2 || is3 || is4;
           if (!isAny) return;
 
-          if (now - id(last_fire_ms) < MIN_GAP) return;   // debounce RF repeats
+          if (now - id(last_fire_ms) < MIN_GAP) return;
           id(last_fire_ms) = now;
 
-          // Any manual remote press cancels pending auto-close immediately.
+          // Any remote press cancels pending auto-close
           id(auto_close_armed) = false;
-          id(cancel_auto_close_btn).execute();  // FIX: execute script, don't press
+          id(cancel_auto_close_btn).execute();
 
-          // Behaviour (your sequence):
-          // - Press -> Reverse
-          // - Press while Reverse -> Stop (remember last_dir=reverse)
-          // - Press while Stopped after reversing -> Forward
-          // - Press while Forward -> Stop
-          if (id(motor_state) == 2) {
-            id(motor_stop_btn).press();
-          } else if (id(motor_state) == 1) {
-            id(motor_stop_btn).press();
-          } else if (id(motor_state) == 0 && id(last_dir) == 2) {
-            id(motor_forward_btn).press();
-          } else {
-            id(motor_reverse_btn).press();
+          // Buttons 1/2: original toggle (use run_forward/run_reverse)
+          if (is1 || is2) {
+            if (id(motor_state) == 2) {
+              id(motor_stop_btn).press();
+            } else if (id(motor_state) == 1) {
+              id(motor_stop_btn).press();
+            } else if (id(motor_state) == 0 && id(last_dir) == 2) {
+              id(motor_forward_btn).press();
+            } else {
+              id(motor_reverse_btn).press();
+            }
+            return;
+          }
+
+          // Buttons 3/4: partial presets — same toggle sequence but use per-button partial scripts
+          if (is3) {
+            if (id(motor_state) == 2) {
+              id(motor_stop_btn).press();
+            } else if (id(motor_state) == 1) {
+              id(motor_stop_btn).press();
+            } else if (id(motor_state) == 0 && id(last_dir) == 2) {
+              id(run_forward_partial_3).execute();
+            } else {
+              id(run_reverse_partial_3).execute();
+            }
+            return;
+          }
+
+          if (is4) {
+            if (id(motor_state) == 2) {
+              id(motor_stop_btn).press();
+            } else if (id(motor_state) == 1) {
+              id(motor_stop_btn).press();
+            } else if (id(motor_state) == 0 && id(last_dir) == 2) {
+              id(run_forward_partial_4).execute();
+            } else {
+              id(run_reverse_partial_4).execute();
+            }
+            return;
           }
 
   on_raw:
@@ -178,6 +248,16 @@ text_sensor:
     name: "RF Btn #2 (learn)"
     icon: mdi:key-star
     update_interval: never
+  - platform: template
+    id: rf_b3_info
+    name: "RF Btn #3 (learn)"
+    icon: mdi:key-star
+    update_interval: never
+  - platform: template
+    id: rf_b4_info
+    name: "RF Btn #4 (learn)"
+    icon: mdi:key-star
+    update_interval: never
 
 binary_sensor:
   - platform: template
@@ -185,40 +265,39 @@ binary_sensor:
     name: "RF Activity"
     device_class: moving
 
-# ----------------- Relays and Auto-Close Switches -----------------
+# ----------------- H-Bridge Enables + Auto-Close Switch -----------------
 switch:
   - platform: gpio
-    pin: 26
-    id: relay1
-    name: "Relay 1 (M1)"
-    inverted: true
-    restore_mode: ALWAYS_OFF
+    pin: GPIO14
+    id: r_en
+    name: "IBT2 R_EN"
+    restore_mode: ALWAYS_ON
 
   - platform: gpio
-    pin: 27
-    id: relay2
-    name: "Relay 2 (M2)"
-    inverted: true
-    restore_mode: ALWAYS_OFF
+    pin: GPIO12
+    id: l_en
+    name: "IBT2 L_EN"
+    restore_mode: ALWAYS_ON
 
   - platform: template
     id: auto_close_enabled
     name: "Auto Close Enabled"
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF   # <— replaces deprecated restore_state
+    restore_mode: RESTORE_DEFAULT_OFF
     turn_on_action:
-      - lambda: '/* no-op, state persisted */'
+      - lambda: '/* no-op */'
     turn_off_action:
       - script.stop: auto_close_timer
       - lambda: |-
           id(auto_close_armed) = false;
 
-# ----------------- Numbers -----------------
+# ----------------- Controls & Timers (PERSISTED) -----------------
 number:
   - platform: template
     id: auto_close_timeout
     name: "Auto Close Timeout (s)"
     optimistic: true
+    restore_value: true
     min_value: 0
     max_value: 240
     step: 1
@@ -228,68 +307,725 @@ number:
     id: forward_time
     name: "Motor Forward Run Time"
     optimistic: true
+    restore_value: true
     min_value: 1
-    max_value: 10
+    max_value: 60
     step: 1
-    initial_value: 8
+    initial_value: 10
 
   - platform: template
     id: reverse_time
     name: "Motor Reverse Run Time"
     optimistic: true
+    restore_value: true
     min_value: 1
-    max_value: 10
+    max_value: 60
     step: 1
-    initial_value: 8
+    initial_value: 10
+
+  - platform: template
+    id: soft_pct
+    name: "Soft Start/Stop %"
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 90
+    step: 1
+    initial_value: 20
+
+  # Soft ramp duration (per start/stop). Will be clamped to half total run if too large.
+  - platform: template
+    id: soft_time_seconds
+    name: "Soft Start/Stop Time (s)"
+    optimistic: true
+    restore_value: true
+    min_value: 0.2
+    max_value: 20
+    step: 0.1
+    initial_value: 2.0
+
+  - platform: template
+    id: mid_pct
+    name: "Mid Speed %"
+    optimistic: true
+    restore_value: true
+    min_value: 20
+    max_value: 100
+    step: 5
+    initial_value: 70
+
+  # Obstacle detection tuning
+  - platform: template
+    id: oc_threshold_v
+    name: "Obstacle Threshold (V @ IS pin)"
+    optimistic: true
+    restore_value: true
+    min_value: 0.05
+    max_value: 20.00
+    step: 0.05
+    initial_value: 5.90
+
+  - platform: template
+    id: oc_debounce_ms
+    name: "Obstacle Debounce (ms)"
+    optimistic: true
+    restore_value: true
+    min_value: 20
+    max_value: 1000
+    step: 10
+    initial_value: 150
+
+  - platform: template
+    id: oc_nudge_pct
+    name: "Obstacle Reverse Duty %"
+    optimistic: true
+    restore_value: true
+    min_value: 20
+    max_value: 80
+    step: 5
+    initial_value: 10
+
+  # ---- Per-button partial preset times (persisted) ----
+  - platform: template
+    id: b3_forward_time
+    name: "B3 Forward Run Time (s)"
+    optimistic: true
+    restore_value: true
+    min_value: 0.5
+    max_value: 60
+    step: 0.5
+    initial_value: 4
+
+  - platform: template
+    id: b3_reverse_time
+    name: "B3 Reverse Run Time (s)"
+    optimistic: true
+    restore_value: true
+    min_value: 0.5
+    max_value: 60
+    step: 0.5
+    initial_value: 4
+
+  - platform: template
+    id: b4_forward_time
+    name: "B4 Forward Run Time (s)"
+    optimistic: true
+    restore_value: true
+    min_value: 0.5
+    max_value: 60
+    step: 0.5
+    initial_value: 6
+
+  - platform: template
+    id: b4_reverse_time
+    name: "B4 Reverse Run Time (s)"
+    optimistic: true
+    restore_value: true
+    min_value: 0.5
+    max_value: 60
+    step: 0.5
+    initial_value: 6
+
+# ----------------- IBT-2 Motor Driver (PWM) -----------------
+output:
+  - platform: ledc
+    pin: GPIO25
+    id: motor_rpwm
+    frequency: 15000Hz
+  - platform: ledc
+    pin: GPIO26
+    id: motor_lpwm
+    frequency: 15000Hz
+
+# ----------------- Sense pins (ADC) -----------------
+sensor:
+  - platform: adc
+    id: isense_r
+    pin: GPIO34
+    name: "IBT2 R_IS (V)"
+    attenuation: 11db
+    update_interval: 50ms
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+      - multiply: 3.067   # divider compensation
+
+  - platform: adc
+    id: isense_l
+    pin: GPIO35
+    name: "IBT2 L_IS (V)"
+    attenuation: 11db
+    update_interval: 50ms
+    filters:
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+      - multiply: 3.067
+      - offset: 0.43      # your calibration offset
+
+  - platform: template
+    id: motor_isense_v
+    name: "Motor Current Sense (V)"
+    unit_of_measurement: "V"
+    update_interval: 50ms
+    lambda: |-
+      if (id(motor_state) == 1) return id(isense_r).state;   // forward (closing)
+      if (id(motor_state) == 2) return id(isense_l).state;   // reverse (opening)
+      return 0.0f;
+
+# ----------------- Obstacle watcher -----------------
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          // Only check when moving and not already handling an obstacle
+          if (id(motor_state) == 0 || id(oc_handling)) {
+            id(oc_over_ms) = 0;
+            return;
+          }
+
+          float v = id(motor_isense_v).state;
+          float thr = (float)id(oc_threshold_v).state;
+
+          if (v > thr) {
+            id(oc_over_ms) += 50;
+          } else {
+            // quick decay to avoid sticky triggers
+            if (id(oc_over_ms) > 50) id(oc_over_ms) -= 50; else id(oc_over_ms) = 0;
+          }
+
+          if (id(oc_over_ms) >= (uint32_t)id(oc_debounce_ms).state) {
+            id(oc_over_ms) = 0;
+            id(obstacle_trip).execute();
+          }
 
 # ----------------- Scripts (stoppable runs) -----------------
 script:
+  # --- Full run scripts (unchanged) ---
   - id: run_forward
     mode: restart
     then:
-      # Any start of motion cancels auto-close
       - script.stop: auto_close_timer
       - lambda: |-
           id(auto_close_armed) = false;
 
-      - switch.turn_on: relay1
-      - switch.turn_off: relay2
+      - output.set_level: { id: motor_lpwm, level: 0.0 }
       - lambda: |-
           id(motor_state) = 1;
-      - delay: !lambda 'return (int)id(forward_time).state * 1000;'
-      - switch.turn_off: relay1
-      - switch.turn_off: relay2
+          id(motor_phase) = 0; // will set below
+
+      # compute soft and mid durations (clamp soft to half total so durations sum exactly)
       - lambda: |-
+          int total_ms = (int)id(forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+
+          // Soft start phase
+          id(motor_phase) = 1;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_rpwm).set_level(soft_duty);
+
+      - delay: !lambda '{
+          int total_ms = (int)id(forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+
+      # Mid-run phase
+      - lambda: |-
+          int total_ms = (int)id(forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+
+          id(motor_phase) = 2;
+          if (mid_ms > 0) {
+            float mid_duty = (float)id(mid_pct).state / 100.0f;
+            if (mid_duty < 0.01f) mid_duty = 0.01f;
+            if (mid_duty > 0.99f) mid_duty = 0.99f;
+            id(motor_rpwm).set_level(mid_duty);
+          }
+
+      - delay: !lambda '{
+          int total_ms = (int)id(forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          return mid_ms > 0 ? mid_ms : 0;
+        }'
+
+      # Soft stop phase
+      - lambda: |-
+          int total_ms = (int)id(forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+
+          id(motor_phase) = 3;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_rpwm).set_level(soft_duty);
+
+      - delay: !lambda '{
+          int total_ms = (int)id(forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+
+      # Stop
+      - lambda: |-
+          id(motor_rpwm).set_level(0.0f);
           id(last_dir) = 1;
           id(motor_state) = 0;
-          // No auto-close arming after forward completes (closing).
+          id(motor_phase) = 0;
+      # Do not automatically arm auto-close here (we treat last_dir=1 as closed)
 
   - id: run_reverse
     mode: restart
     then:
-      # Any start of motion cancels auto-close (if previously armed)
       - script.stop: auto_close_timer
       - lambda: |-
           id(auto_close_armed) = false;
 
-      - switch.turn_off: relay1
-      - switch.turn_on: relay2
+      - output.set_level: { id: motor_rpwm, level: 0.0 }
       - lambda: |-
           id(motor_state) = 2;
-      - delay: !lambda 'return (int)id(reverse_time).state * 1000;'
-      - switch.turn_off: relay1
-      - switch.turn_off: relay2
+          id(motor_phase) = 0;
+
+      # compute soft and mid durations (clamp)
       - lambda: |-
+          int total_ms = (int)id(reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+
+          // soft start for reverse
+          id(motor_phase) = 1;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_lpwm).set_level(soft_duty);
+
+      - delay: !lambda '{
+          int total_ms = (int)id(reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+
+      # Mid-run
+      - lambda: |-
+          int total_ms = (int)id(reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+
+          id(motor_phase) = 2;
+          if (mid_ms > 0) {
+            float mid_duty = (float)id(mid_pct).state / 100.0f;
+            if (mid_duty < 0.01f) mid_duty = 0.01f;
+            if (mid_duty > 0.99f) mid_duty = 0.99f;
+            id(motor_lpwm).set_level(mid_duty);
+          }
+
+      - delay: !lambda '{
+          int total_ms = (int)id(reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          return mid_ms > 0 ? mid_ms : 0;
+        }'
+
+      # Soft stop
+      - lambda: |-
+          int total_ms = (int)id(reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+
+          id(motor_phase) = 3;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_lpwm).set_level(soft_duty);
+
+      - delay: !lambda '{
+          int total_ms = (int)id(reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+
+      # Stop and possibly arm auto-close after reverse completes (opening)
+      - lambda: |-
+          id(motor_lpwm).set_level(0.0f);
           id(last_dir) = 2;
           id(motor_state) = 0;
-      # Arm auto-close ONLY after a natural (full) reverse run completes
+          id(motor_phase) = 0;
+
+      - lambda: |-
+          // Only arm auto-close if enabled and reverse completed naturally
+          if (id(auto_close_enabled).state) {
+            id(auto_close_timer).execute();
+          }
+
+  # --- Partial / preset scripts for Button 3 ---
+  - id: run_forward_partial_3
+    mode: restart
+    then:
+      - script.stop: auto_close_timer
+      - lambda: |-
+          id(auto_close_armed) = false;
+      - output.set_level: { id: motor_lpwm, level: 0.0 }
+      - lambda: |-
+          id(motor_state) = 1;
+          id(motor_phase) = 0;
+      # compute durations using b3_forward_time
+      - lambda: |-
+          int total_ms = (int)id(b3_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          id(motor_phase) = 1;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_rpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b3_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b3_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          id(motor_phase) = 2;
+          if (mid_ms > 0) {
+            float mid_duty = (float)id(mid_pct).state / 100.0f;
+            if (mid_duty < 0.01f) mid_duty = 0.01f;
+            if (mid_duty > 0.99f) mid_duty = 0.99f;
+            id(motor_rpwm).set_level(mid_duty);
+          }
+      - delay: !lambda '{
+          int total_ms = (int)id(b3_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          return mid_ms > 0 ? mid_ms : 0;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b3_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          id(motor_phase) = 3;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_rpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b3_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          id(motor_rpwm).set_level(0.0f);
+          id(last_dir) = 1;
+          id(motor_state) = 0;
+          id(motor_phase) = 0;
+
+  - id: run_reverse_partial_3
+    mode: restart
+    then:
+      - script.stop: auto_close_timer
+      - lambda: |-
+          id(auto_close_armed) = false;
+      - output.set_level: { id: motor_rpwm, level: 0.0 }
+      - lambda: |-
+          id(motor_state) = 2;
+          id(motor_phase) = 0;
+      - lambda: |-
+          int total_ms = (int)id(b3_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          id(motor_phase) = 1;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_lpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b3_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b3_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          id(motor_phase) = 2;
+          if (mid_ms > 0) {
+            float mid_duty = (float)id(mid_pct).state / 100.0f;
+            if (mid_duty < 0.01f) mid_duty = 0.01f;
+            if (mid_duty > 0.99f) mid_duty = 0.99f;
+            id(motor_lpwm).set_level(mid_duty);
+          }
+      - delay: !lambda '{
+          int total_ms = (int)id(b3_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          return mid_ms > 0 ? mid_ms : 0;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b3_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          id(motor_phase) = 3;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_lpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b3_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          id(motor_lpwm).set_level(0.0f);
+          id(last_dir) = 2;
+          id(motor_state) = 0;
+          id(motor_phase) = 0;
+
+  # --- Partial / preset scripts for Button 4 (mirror of Button 3) ---
+  - id: run_forward_partial_4
+    mode: restart
+    then:
+      - script.stop: auto_close_timer
+      - lambda: |-
+          id(auto_close_armed) = false;
+      - output.set_level: { id: motor_lpwm, level: 0.0 }
+      - lambda: |-
+          id(motor_state) = 1;
+          id(motor_phase) = 0;
+      - lambda: |-
+          int total_ms = (int)id(b4_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          id(motor_phase) = 1;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_rpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b4_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b4_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          id(motor_phase) = 2;
+          if (mid_ms > 0) {
+            float mid_duty = (float)id(mid_pct).state / 100.0f;
+            if (mid_duty < 0.01f) mid_duty = 0.01f;
+            if (mid_duty > 0.99f) mid_duty = 0.99f;
+            id(motor_rpwm).set_level(mid_duty);
+          }
+      - delay: !lambda '{
+          int total_ms = (int)id(b4_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          return mid_ms > 0 ? mid_ms : 0;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b4_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          id(motor_phase) = 3;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_rpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b4_forward_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          id(motor_rpwm).set_level(0.0f);
+          id(last_dir) = 1;
+          id(motor_state) = 0;
+          id(motor_phase) = 0;
+
+  - id: run_reverse_partial_4
+    mode: restart
+    then:
+      - script.stop: auto_close_timer
+      - lambda: |-
+          id(auto_close_armed) = false;
+      - output.set_level: { id: motor_rpwm, level: 0.0 }
+      - lambda: |-
+          id(motor_state) = 2;
+          id(motor_phase) = 0;
+      - lambda: |-
+          int total_ms = (int)id(b4_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          id(motor_phase) = 1;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_lpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b4_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b4_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          id(motor_phase) = 2;
+          if (mid_ms > 0) {
+            float mid_duty = (float)id(mid_pct).state / 100.0f;
+            if (mid_duty < 0.01f) mid_duty = 0.01f;
+            if (mid_duty > 0.99f) mid_duty = 0.99f;
+            id(motor_lpwm).set_level(mid_duty);
+          }
+      - delay: !lambda '{
+          int total_ms = (int)id(b4_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          int mid_ms = total_ms - (soft_ms * 2);
+          return mid_ms > 0 ? mid_ms : 0;
+        }'
+      - lambda: |-
+          int total_ms = (int)id(b4_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          id(motor_phase) = 3;
+          float soft_duty = (float)id(soft_pct).state / 100.0f;
+          if (soft_duty < 0.01f) soft_duty = 0.01f;
+          if (soft_duty > 0.99f) soft_duty = 0.99f;
+          id(motor_lpwm).set_level(soft_duty);
+      - delay: !lambda '{
+          int total_ms = (int)id(b4_reverse_time).state * 1000;
+          int requested_soft = (int)(id(soft_time_seconds).state * 1000.0);
+          int soft_ms = requested_soft;
+          if (soft_ms * 2 > total_ms) soft_ms = total_ms / 2;
+          return soft_ms;
+        }'
+      - lambda: |-
+          id(motor_lpwm).set_level(0.0f);
+          id(last_dir) = 2;
+          id(motor_state) = 0;
+          id(motor_phase) = 0;
+
+  - id: obstacle_trip
+    mode: restart
+    then:
+      # mark handling
+      - lambda: |-
+          id(oc_handling) = true;
+
+      # If we're in the soft-stop phase AND the gate was closing (last_dir == 1),
+      # treat this as "gate closed" — stop and DO NOT reverse.
       - if:
           condition:
-            and:
-              - switch.is_on: auto_close_enabled
-              - lambda: 'return (int)id(auto_close_timeout).state > 0;'
+            - lambda: 'return id(motor_phase) == 3 && id(last_dir) == 1;'
           then:
-            - script.execute: auto_close_timer
+            - output.set_level: { id: motor_rpwm, level: 0.0 }
+            - output.set_level: { id: motor_lpwm, level: 0.0 }
+            - lambda: |-
+                // mark as closed and cleanup
+                id(last_dir) = 1;
+                id(motor_state) = 0;
+                id(auto_close_armed) = false;
+                id(oc_handling) = false;
+            - script.stop: auto_close_timer
+          else:
+            # Normal obstacle handling: immediate stop, brief reverse nudge, stop
+            - output.set_level: { id: motor_rpwm, level: 0.0 }
+            - output.set_level: { id: motor_lpwm, level: 0.0 }
+            - lambda: |-
+                if (id(motor_state) == 1 || id(motor_state) == 2) id(last_dir) = id(motor_state);
+                id(motor_state) = 0;
+                id(auto_close_armed) = false;
+            - script.stop: auto_close_timer
+            - delay: 200ms
+            - lambda: |-
+                float duty = (float)id(oc_nudge_pct).state / 100.0f;
+                if (duty < 0.2f) duty = 0.2f;
+                if (duty > 0.8f) duty = 0.8f;
+                // If we were going forward (closing), nudge reverse (open)
+                // If we were going reverse (opening), nudge forward (close-away)
+                if (id(last_dir) == 1) {
+                  id(motor_lpwm).set_level(duty);
+                } else {
+                  id(motor_rpwm).set_level(duty);
+                }
+            - delay: 1s
+            - lambda: |-
+                id(motor_rpwm).set_level(0.0f);
+                id(motor_lpwm).set_level(0.0f);
+                id(motor_state) = 0;
+                id(oc_handling) = false;
 
   - id: auto_close_timer
     mode: restart
@@ -298,8 +1034,6 @@ script:
           id(auto_close_armed) = true;
       - delay: !lambda 'return (int)id(auto_close_timeout).state * 1000;'
       - lambda: |-
-          // Only close if still armed, still stopped, last action was reverse,
-          // and auto-close is still enabled.
           if (id(auto_close_armed) &&
               id(motor_state) == 0 &&
               id(last_dir) == 2) {
@@ -314,9 +1048,8 @@ script:
       - lambda: |-
           id(auto_close_armed) = false;
 
-# ----------------- Control Buttons -----------------
+# ----------------- Control & Test Buttons -----------------
 button:
-  # Enrollment (two buttons total)
   - platform: template
     name: "Learn Button #1 (KeeLoq)"
     id: rf_enroll_b1
@@ -331,7 +1064,21 @@ button:
       - lambda: |-
           id(enroll_target) = 2; id(cap_needed) = 2; id(rf_b2_info).publish_state("arming");
 
-  # Motor control (script-driven; stoppable)
+  - platform: template
+    name: "Learn Button #3 (KeeLoq) - Partial Preset"
+    id: rf_enroll_b3
+    on_press:
+      - lambda: |-
+          id(enroll_target) = 3; id(cap_needed) = 2; id(rf_b3_info).publish_state("arming");
+
+  - platform: template
+    name: "Learn Button #4 (KeeLoq) - Partial Preset"
+    id: rf_enroll_b4
+    on_press:
+      - lambda: |-
+          id(enroll_target) = 4; id(cap_needed) = 2; id(rf_b4_info).publish_state("arming");
+
+  # Motor control (script-driven; stoppable) - main buttons
   - platform: template
     name: "Motor Forward"
     id: motor_forward_btn
@@ -356,19 +1103,35 @@ button:
     name: "Motor Stop"
     id: motor_stop_btn
     on_press:
-      # capture last direction before clearing
       - lambda: |-
           if (id(motor_state) == 1 || id(motor_state) == 2) id(last_dir) = id(motor_state);
-      - script.stop: run_forward
-      - script.stop: run_reverse
-      - switch.turn_off: relay1
-      - switch.turn_off: relay2
+      - output.set_level: { id: motor_rpwm, level: 0.0 }
+      - output.set_level: { id: motor_lpwm, level: 0.0 }
       - lambda: |-
           id(motor_state) = 0;
-      # Stopping with remote cancels pending auto-close
+          id(motor_phase) = 0;
       - script.stop: auto_close_timer
       - lambda: |-
           id(auto_close_armed) = false;
+
+  # Quick test nudges
+  - platform: template
+    name: "TEST: Nudge Forward (50% 1s)"
+    id: test_nudge_forward
+    on_press:
+      - output.set_level: { id: motor_lpwm, level: 0.0 }
+      - output.set_level: { id: motor_rpwm, level: 0.5 }
+      - delay: 1s
+      - output.set_level: { id: motor_rpwm, level: 0.0 }
+
+  - platform: template
+    name: "TEST: Nudge Reverse (50% 1s)"
+    id: test_nudge_reverse
+    on_press:
+      - output.set_level: { id: motor_rpwm, level: 0.0 }
+      - output.set_level: { id: motor_lpwm, level: 0.5 }
+      - delay: 1s
+      - output.set_level: { id: motor_lpwm, level: 0.0 }
 
 web_server:
   port: 80
